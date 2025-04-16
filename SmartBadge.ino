@@ -23,8 +23,8 @@ MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
 #define PIR_PIN A0
 bool accessoConsentito = false;
 
-// --- LED Allarme (analogico A1) ---
-#define LED_ALLARME_PIN A1
+// --- LED Allarme (digitale D2) ---
+#define LED_ALLARME_PIN 2
 bool allarmeAttivo = false;
 
 // --- Servo (A3) ---
@@ -33,6 +33,9 @@ Servo servoPorta;
 
 // --- Buzzer (analogico A2) ---
 #define BUZZER_PIN A2
+
+// --- Fotoresistenza (analogico A1) ---
+#define FOTORES_PIN A1
 
 // --- Encoder ---
 #define ENCODER_CLK 4
@@ -43,8 +46,14 @@ bool encoderPremuto = false;
 int indiceMenu = 0;
 int indiceUtenteVisualizzato = 0;
 bool visualizzandoLog = false;
+bool visualizzandoLuminosita = false;
 unsigned long ultimoSpostamentoMenu = 0;
-const unsigned long debounceMenu = 300; // Sensibilità regolata
+const unsigned long debounceMenu = 300;
+
+// --- PID ---
+float setpoint = 700.0; // valore target di luminosità
+float kp = 0.5, ki = 0.05, kd = 0.1;
+float errorePrecedente = 0, integrale = 0;
 
 // --- Timer Allarme ---
 unsigned long ultimoCambioAllarme = 0;
@@ -55,6 +64,15 @@ const unsigned long intervalloAllarme = 500;
 int tentativiFalliti = 0;
 const int MAX_TENTATIVI = 5;
 
+// Limiti per l'integrale (anti-windup)
+float integraleMin = -500;
+float integraleMax = 500;
+
+// Variabile per smoothing
+float uscitaSmoothed = 50;
+
+float luminositaAttuale = 0;  // inizializza in alto
+
 // --- Struttura Utente ---
 struct Utente {
   byte uid[4];
@@ -64,8 +82,10 @@ struct Utente {
 };
 
 Utente utenti[] = {
-  {{0x8D, 0x1B, 0xF3, 0x2C}, "Salvatore", "Dipendente", 0},
-  {{0xEC, 0x1C, 0x7B, 0xEC}, "Antonio", "Amministratore", 0}
+  {{0x3B, 0x26, 0xA1, 0x52}, "Salvatore", "Dipendente", 0},
+  {{0x4B, 0x1F, 0xB3, 0x52}, "Antonio", "Dipendente", 0},
+  {{0x4B, 0x73, 0xD3, 0x52}, "Gianluca", "Amministratore", 0},
+  {{0xDB, 0x72, 0xB6, 0x52}, "Carlo", "Amministratore", 0}
 };
 
 const int NUM_UTENTI = sizeof(utenti) / sizeof(utenti[0]);
@@ -79,7 +99,7 @@ void setup() {
   lcd.backlight();
 
   servoPorta.attach(SERVO_PIN);
-  servoPorta.write(0);
+  servoPorta.write(6);
 
   pinMode(PIR_PIN, INPUT);
   pinMode(LED_ALLARME_PIN, OUTPUT);
@@ -92,6 +112,8 @@ void setup() {
   pinMode(ENCODER_DT, INPUT);
   pinMode(ENCODER_SW, INPUT_PULLUP);
 
+  digitalWrite(LED_ALLARME_PIN, HIGH);
+
   lcd.setCursor(0, 0);
   lcd.print("Avvicinare badge");
   lcd.setCursor(0, 1);
@@ -99,8 +121,11 @@ void setup() {
 }
 
 void loop() {
+  
+  gestisciPID();
+
   if (!accessoConsentito) {
-    //checkPIR();
+    checkPIR();
   }
 
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
@@ -149,13 +174,12 @@ void gestisciAccesso(String nome, String ruolo) {
   tone(BUZZER_PIN, 1000, 200);
   servoPorta.write(90);
   delay(3000);
-  servoPorta.write(0);
+  servoPorta.write(6);
   lcd.clear();
 
   accessoConsentito = true;
   tentativiFalliti = 0;
   indiceMenu = 0;
-
   mostraMenu();
 }
 
@@ -196,19 +220,44 @@ void impostaRGB(int r, int g, int b) {
 void attivaAllarme() {
   lcd.clear();
   lcd.print("ALLARME ATTIVO");
-  digitalWrite(LED_ALLARME_PIN, HIGH);
+  digitalWrite(LED_ALLARME_PIN, LOW);
   allarmeAttivo = true;
   delay(2000);
   lcd.clear();
 }
 
-void checkPIR() {
-  if (digitalRead(PIR_PIN) == HIGH) {
+void gestisciPID() {
+  int valoreLuce = analogRead(FOTORES_PIN);
+  float errore = setpoint - valoreLuce;
+  float derivata = errore - errorePrecedente;
+
+  float nuovaIntegrale = integrale + errore;
+  float outputTest = kp * errore + ki * nuovaIntegrale + kd * derivata;
+
+  if (outputTest >= 0 && outputTest <= 255) {
+    integrale = constrain(nuovaIntegrale, -500, 500);
+  }
+
+  //Serial.println("Valore luce");
+  //Serial.println(valoreLuce);
+
+  float output = kp * errore + ki * integrale + kd * derivata;
+  errorePrecedente = errore;
+
+  // Smoothing dinamico basato sulla distanza
+  float distanza = abs(output - luminositaAttuale);
+  float smoothingFactor = constrain(distanza / 100.0, 0.05, 0.4);
+  luminositaAttuale += smoothingFactor * (output - luminositaAttuale);
+
+  int intensita = constrain((int)luminositaAttuale, 0, 255);
+  impostaRGB(intensita, intensita, intensita);
+
+  if (visualizzandoLuminosita) {
     lcd.clear();
-    lcd.print("Movimento rilevato");
+    lcd.print("Luce ambiente:");
     lcd.setCursor(0, 1);
-    lcd.print("Senza accesso");
-    attivaAllarme();
+    lcd.print(valoreLuce);
+    delay(300);
   }
 }
 
@@ -234,7 +283,7 @@ void gestisciMenu() {
         indiceMenu--;
       }
       if (utenti[indiceUtenteCorrente].ruolo == "Amministratore") {
-        indiceMenu = constrain(indiceMenu, 0, 2);
+        indiceMenu = constrain(indiceMenu, 0, 3);
       } else {
         indiceMenu = constrain(indiceMenu, 0, 1);
       }
@@ -245,8 +294,9 @@ void gestisciMenu() {
   ultimoStatoEncoder = statoClk;
 
   if (digitalRead(ENCODER_SW) == LOW && !encoderPremuto) {
-    if (visualizzandoLog) {
+    if (visualizzandoLog || visualizzandoLuminosita) {
       visualizzandoLog = false;
+      visualizzandoLuminosita = false;
       mostraMenu();
     } else {
       selezionaOpzioneMenu();
@@ -260,12 +310,13 @@ void gestisciMenu() {
 void mostraMenu() {
   lcd.clear();
   if (utenti[indiceUtenteCorrente].ruolo == "Amministratore") {
-    if (indiceMenu == 0) lcd.print("1. Vedi Log");
-    else if (indiceMenu == 1) lcd.print("2. Attiva Allarme");
-    else if (indiceMenu == 2) lcd.print("3. Reset Allarme");
+    if (indiceMenu == 0) lcd.print("1.Vedi Log");
+    else if (indiceMenu == 1) lcd.print("2.Attiva Allarme");
+    else if (indiceMenu == 2) lcd.print("3.Reset Allarme");
+    else if (indiceMenu == 3) lcd.print("4.Luce attuale");
   } else {
-    if (indiceMenu == 0) lcd.print("1. I miei accessi");
-    else lcd.print("2. Attiva Allarme");
+    if (indiceMenu == 0) lcd.print("1.I miei accessi");
+    else lcd.print("2.Attiva Allarme");
   }
 }
 
@@ -275,15 +326,17 @@ void selezionaOpzioneMenu() {
     if (indiceMenu == 0) {
       visualizzandoLog = true;
       indiceUtenteVisualizzato = -1;
-      ultimoStatoEncoder = digitalRead(ENCODER_CLK); // 🔁 reset stato encoder per non bloccare il primo input
+      ultimoStatoEncoder = digitalRead(ENCODER_CLK);
     } else if (indiceMenu == 1) {
       attivaAllarme();
     } else if (indiceMenu == 2){
       allarmeAttivo = false;
-      digitalWrite(LED_ALLARME_PIN, LOW);
+      digitalWrite(LED_ALLARME_PIN, HIGH);
       noTone(BUZZER_PIN);
       lcd.print("Allarme disattivo");
       delay(1500);
+    } else if (indiceMenu == 3) {
+      visualizzandoLuminosita = true;
     }
   } else {
     if (indiceMenu == 0) {
@@ -295,8 +348,26 @@ void selezionaOpzioneMenu() {
       attivaAllarme();
     }
   }
- lcd.clear();
-  if (!visualizzandoLog) {
+  lcd.clear();
+  if (!visualizzandoLog && !visualizzandoLuminosita) {
     mostraMenu();
   }
 }
+
+void checkPIR() {
+  int valorePIR = analogRead(PIR_PIN);
+
+  Serial.print("Valore PIR: ");
+  Serial.println(valorePIR);
+
+  if (valorePIR >= 650) {
+    Serial.println("Movimento rilevato nel blocco!");
+    if (!accessoConsentito) {
+      attivaAllarme();
+    }
+  }
+
+  delay(300); // <-- Aggiunto per rallentare la stampa
+}
+
+
